@@ -242,6 +242,15 @@ struct v4l2_loopback_device {
 
 	wait_queue_head_t read_event;
 	spinlock_t lock;
+
+  /* If mirror_to_ is null, this is considered a capture device, i.e. a device
+   * that a userspace program reads from (such as a webcam). If mirror_to_ is
+   * not null, this is considered an output device where a userspace program
+   * writes into. In this case mirror_to_ points to the capture device we want
+   * to send our input to.
+   */
+  struct v4l2_loopback_device* mirror_to_;
+
 };
 
 /* types of opener shows what opener wants to do with loopback */
@@ -568,7 +577,7 @@ static struct v4l2_loopback_device *v4l2loopback_cd2dev(struct device *cd)
 	return devs[nr];
 }
 
-static struct v4l2_loopback_device *v4l2loopback_getdevice(struct file *f)
+static struct v4l2_loopback_device *v4l2loopback_getdevice_unaliased(struct file *f)
 {
 	struct video_device *loopdev = video_devdata(f);
 	struct v4l2loopback_private *ptr =
@@ -581,6 +590,21 @@ static struct v4l2_loopback_device *v4l2loopback_getdevice(struct file *f)
 	}
 	return devs[nr];
 }
+
+/* Retrieves a device while respecting aliasing. That is, for a dummy sink
+ * device we will get the actual target device instead of the dummy device.
+ */
+static struct v4l2_loopback_device*
+v4l2loopback_getdevice(struct file*f)
+{
+  struct v4l2_loopback_device* dev = v4l2loopback_getdevice_unaliased(f);
+  if (dev->mirror_to_ != NULL)
+    return dev->mirror_to_;
+  else
+    return dev;
+}
+
+
 
 /* forward declarations */
 static void init_buffers(struct v4l2_loopback_device *dev);
@@ -618,7 +642,7 @@ static inline void unset_flags(struct v4l2l_buffer *buffer)
  */
 static int vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
 {
-	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
+	struct v4l2_loopback_device *dev = v4l2loopback_getdevice_unaliased(file);
 	int devnr = ((struct v4l2loopback_private *)video_get_drvdata(dev->vdev))->devicenr;
 
 	strlcpy(cap->driver, "v4l2 loopback", sizeof(cap->driver));
@@ -635,7 +659,20 @@ static int vidioc_querycap(struct file *file, void *priv, struct v4l2_capability
 	cap->capabilities =
 		V4L2_CAP_STREAMING | V4L2_CAP_READWRITE;
 	if (dev->announce_all_caps) {
-		cap->capabilities |= V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_OUTPUT;
+	  if (devices == 1) {
+	    /* Create a combo device if we only have one. */
+	    cap->capabilities |= V4L2_CAP_VIDEO_OUTPUT | V4L2_CAP_VIDEO_CAPTURE;
+	  } else {
+	    /* Else pair devices and assign roles to them depending on if they are
+	     * the sink, e.g. "output device" (where userspace writes data into the
+	     * driver) or the capture device, e.g. webcam (where userspace reads data).
+	     */
+	    if (dev->mirror_to_ == NULL) {
+	      cap->capabilities |= V4L2_CAP_VIDEO_CAPTURE;
+	    } else {
+	      cap->capabilities |= V4L2_CAP_VIDEO_OUTPUT;
+	    }
+	  }
 	} else {
 
 		if (dev->ready_for_capture) {
@@ -1315,7 +1352,7 @@ static int vidioc_s_input(struct file *file, void *fh, unsigned int i)
 /* --------------- V4L2 ioctl buffer related calls ----------------- */
 
 /* negotiate buffer type
- * only mmap streaming supported
+ * only mmap streaming supported. [mcasas]: dummy accept DMABUF
  * called on VIDIOC_REQBUFS
  */
 static int vidioc_reqbufs(struct file *file, void *fh, struct v4l2_requestbuffers *b)
@@ -1376,6 +1413,8 @@ static int vidioc_reqbufs(struct file *file, void *fh, struct v4l2_requestbuffer
 		opener->buffers_number = b->count;
 		if (opener->buffers_number < dev->used_buffers)
 			dev->used_buffers = opener->buffers_number;
+		return 0;
+	case V4L2_MEMORY_DMABUF:
 		return 0;
 	default:
 		return -EINVAL;
@@ -1896,7 +1935,7 @@ static int free_buffers(struct v4l2_loopback_device *dev)
 		dev->timeout_image = NULL;
 	}
 	dev->imagesize = 0;
-
+	
 	return 0;
 }
 /* frees buffers, if they are no longer needed */
@@ -2137,6 +2176,7 @@ static int v4l2_loopback_init(struct v4l2_loopback_device *dev, int nr)
 	dev->timeout_jiffies = 0;
 	dev->timeout_image = NULL;
 	dev->timeout_happened = 0;
+	dev->mirror_to_ = NULL;
 
 	/* FIXME set buffers to 0 */
 
@@ -2252,6 +2292,11 @@ static void free_devices(void)
 	}
 }
 
+int is_odd(int number) {
+  return number % 2 != 0;
+}
+
+
 int __init init_module(void)
 {
 	int ret;
@@ -2308,6 +2353,16 @@ int __init init_module(void)
 			free_devices();
 			return ret;
 		}
+
+		if (is_odd(i)) {
+		  /* Make this device a sink device and feed into the previous device.
+		   * Since we're starting at 0, device 1 pairs to 0, device 3 to device 2,
+		   * and so on. Note that this is not necessarily the device numbers in
+		   * /dev/video*, which can be different if video_nr is specified.
+		   */
+		  devs[i]->mirror_to_ = devs[i - 1];
+		}
+
 		/* register the device -> it creates /dev/video* */
 		if (video_register_device(devs[i]->vdev, VFL_TYPE_GRABBER, video_nr[i]) < 0) {
 			video_device_release(devs[i]->vdev);
